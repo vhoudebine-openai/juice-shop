@@ -1,0 +1,23 @@
+name: Codex SAST PR
+
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+concurrency:
+  group: codex-sast-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex-sast:
+    name: Codex SAST
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/codex-sast.yml
+    secrets: inherit

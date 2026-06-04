@@ -1,0 +1,156 @@
+name: Codex SAST
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  codex-sast:
+    name: Run Codex SAST scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Prepare scan output directory
+        run: mkdir -p test-outputs
+
+      - name: Install Juice Shop dependencies
+        run: |
+          set -o pipefail
+          npm install 2>&1 | tee test-outputs/npm-install.log
+        shell: bash
+
+      - name: Build Juice Shop
+        run: |
+          set -o pipefail
+          npm run build:frontend 2>&1 | tee test-outputs/build-frontend.log
+          npm run build:server 2>&1 | tee test-outputs/build-server.log
+        shell: bash
+
+      - name: Check SAST configuration
+        env:
+          OPENAI_API_KEY: ${{ secrets.TAC3KEY }}
+          CODEX_MODEL: ${{ vars.CYBER54 }}
+          SASTPROMPT: ${{ vars.SASTPROMPT }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SASTPROMPT:-}" ]; then
+            echo "Repository variable SASTPROMPT is required." | tee test-outputs/codex-sast-error.txt
+            exit 1
+          fi
+
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "Repository secret TAC3KEY is required." | tee test-outputs/codex-sast-error.txt
+            exit 1
+          fi
+
+          if [ -z "${CODEX_MODEL:-}" ]; then
+            echo "Repository variable CYBER54 is required." | tee test-outputs/codex-sast-error.txt
+            exit 1
+          fi
+
+          printf '%s\n' "$SASTPROMPT" > test-outputs/codex-sast-prompt.txt
+          printf '%s\n' "$CODEX_MODEL" > test-outputs/codex-sast-model.txt
+        shell: bash
+
+      - name: Run Codex SAST scan
+        uses: openai/codex-action@main
+        with:
+          openai-api-key: ${{ secrets.TAC3KEY }}
+          model: ${{ vars.CYBER54 }}
+          working-directory: ${{ github.workspace }}
+          output-file: test-outputs/codex-sast-summary.md
+          sandbox: workspace-write
+          prompt: |
+            ${{ vars.SASTPROMPT }}
+
+            Follow the requested output directory exactly: test-outputs/SAST-FINDINGS.
+            Save all SAST scan outputs, notes, summaries, source files, sink files, PoCs, diagrams, and machine-readable findings under test-outputs/SAST-FINDINGS. Do not modify application source files.
+            Save SARIF v2.1.0 findings at exactly test-outputs/SAST-FINDINGS/vulns.json.
+            Any SARIF output must set runs[].tool.driver.name to OpenAI Cyber.
+          codex-args: '["--full-auto"]'
+
+      - name: Validate SAST SARIF output
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ ! -f test-outputs/SAST-FINDINGS/vulns.json ]; then
+            echo "Expected SARIF file was not created: test-outputs/SAST-FINDINGS/vulns.json" | tee test-outputs/codex-sast-sarif-error.txt
+            exit 1
+          fi
+
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' test-outputs/SAST-FINDINGS/vulns.json >/dev/null
+        shell: bash
+
+      - name: Normalize SAST SARIF metadata
+        if: always() && hashFiles('test-outputs/SAST-FINDINGS/vulns.json') != ''
+        run: |
+          set -euo pipefail
+
+          sarif="test-outputs/SAST-FINDINGS/vulns.json"
+          automation_id="openai-cyber-sast"
+          tmp="${sarif}.tmp"
+          jq --arg automation_id "$automation_id" '
+            .runs |= map(
+              .tool.driver.name = "OpenAI Cyber" |
+              .tool.driver.fullName = "OpenAI Cyber SAST" |
+              .tool.driver.informationUri = "https://openai.com" |
+              .automationDetails.id = $automation_id
+            )
+          ' "$sarif" > "$tmp"
+          mv "$tmp" "$sarif"
+        shell: bash
+
+      - name: Prepare SAST SARIF for code scanning
+        if: always() && hashFiles('test-outputs/SAST-FINDINGS/vulns.json') != ''
+        run: |
+          set -euo pipefail
+
+          cp test-outputs/SAST-FINDINGS/vulns.json vulns.sarif
+          cp vulns.sarif test-outputs/SAST-FINDINGS/vulns.sarif
+        shell: bash
+
+      - name: Upload result to GitHub Code Scanning
+        if: always() && hashFiles('vulns.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: vulns.sarif
+
+      - name: Upload SAST outputs
+        id: upload-sast-outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-sast-test-outputs
+          path: test-outputs/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Summarize SAST artifact
+        if: always() && steps.upload-sast-outputs.outcome == 'success'
+        run: |
+          {
+            echo "## SAST artifact"
+            echo
+            echo "- Name: codex-sast-test-outputs"
+            echo "- URL: ${{ steps.upload-sast-outputs.outputs.artifact-url }}"
+            echo "- ID: ${{ steps.upload-sast-outputs.outputs.artifact-id }}"
+            echo "- SHA-256: ${{ steps.upload-sast-outputs.outputs.artifact-digest }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
