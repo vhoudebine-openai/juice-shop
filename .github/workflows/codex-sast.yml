@@ -1,4 +1,4 @@
-name: Codex SAST
+name: Codex Security
 
 on:
   workflow_call:
@@ -9,148 +9,195 @@ permissions:
   security-events: write
 
 jobs:
-  codex-sast:
-    name: Run Codex SAST scan
+  codex-security:
+    name: Review pull request with Codex Security
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout repository
+      - name: Checkout pull request merge commit
         uses: actions/checkout@v6
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
         with:
-          node-version: 22
-          package-manager-cache: false
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch pull request refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "$PR_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head"
+        shell: bash
 
       - name: Prepare scan output directory
-        run: mkdir -p test-outputs
-
-      - name: Install Juice Shop dependencies
         run: |
-          set -o pipefail
-          npm install 2>&1 | tee test-outputs/npm-install.log
+          mkdir -p test-outputs
+          # Keep Codex Security's temporary scan bundle in a predictable location.
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
         shell: bash
 
-      - name: Build Juice Shop
-        run: |
-          set -o pipefail
-          npm run build:frontend 2>&1 | tee test-outputs/build-frontend.log
-          npm run build:server 2>&1 | tee test-outputs/build-server.log
-        shell: bash
-
-      - name: Check SAST configuration
+      - name: Check Codex configuration
         env:
           OPENAI_API_KEY: ${{ secrets.TAC3KEY }}
           CODEX_MODEL: ${{ vars.CYBER54 }}
-          SASTPROMPT: ${{ vars.SASTPROMPT }}
         run: |
           set -euo pipefail
 
-          if [ -z "${SASTPROMPT:-}" ]; then
-            echo "Repository variable SASTPROMPT is required." | tee test-outputs/codex-sast-error.txt
-            exit 1
-          fi
-
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "Repository secret TAC3KEY is required." | tee test-outputs/codex-sast-error.txt
+            echo "Repository secret TAC3KEY is required." | tee test-outputs/codex-security-error.txt
             exit 1
           fi
 
           if [ -z "${CODEX_MODEL:-}" ]; then
-            echo "Repository variable CYBER54 is required." | tee test-outputs/codex-sast-error.txt
+            echo "Repository variable CYBER54 is required." | tee test-outputs/codex-security-error.txt
             exit 1
           fi
 
-          printf '%s\n' "$SASTPROMPT" > test-outputs/codex-sast-prompt.txt
-          printf '%s\n' "$CODEX_MODEL" > test-outputs/codex-sast-model.txt
+          printf '%s\n' "$CODEX_MODEL" > test-outputs/codex-security-model.txt
         shell: bash
 
-      - name: Run Codex SAST scan
-        uses: openai/codex-action@main
+      - name: Install Codex Security plugin
+        id: install-codex-security
+        env:
+          # Codex Security 0.1.10. Pinning the source makes CI runs reproducible.
+          CODEX_SECURITY_PLUGIN_REF: 7fd3161ce5ed1ae1f9300be629341c924f4f276a
+        run: |
+          set -euo pipefail
+
+          plugin_source="$RUNNER_TEMP/openai-plugins"
+          codex_home="$HOME/.codex"
+          marketplace_dir="$HOME/.agents/plugins"
+
+          git init --quiet "$plugin_source"
+          git -C "$plugin_source" remote add origin https://github.com/openai/plugins.git
+          git -C "$plugin_source" sparse-checkout init --cone
+          git -C "$plugin_source" sparse-checkout set plugins/codex-security
+          git -C "$plugin_source" fetch --quiet --depth 1 origin "$CODEX_SECURITY_PLUGIN_REF"
+          git -C "$plugin_source" checkout --quiet --detach FETCH_HEAD
+
+          plugin_manifest="$plugin_source/plugins/codex-security/.codex-plugin/plugin.json"
+          plugin_version="$(jq -er '.version | select(type == "string" and length > 0)' "$plugin_manifest")"
+          plugin_install_dir="$codex_home/plugins/cache/ci-local/codex-security/$plugin_version"
+
+          mkdir -p "$plugin_install_dir" "$marketplace_dir"
+          cp -a "$plugin_source/plugins/codex-security/." "$plugin_install_dir/"
+
+          jq -n \
+            --arg plugin_path "./.codex/plugins/cache/ci-local/codex-security/$plugin_version" \
+            '{
+              name: "ci-local",
+              plugins: [
+                {
+                  name: "codex-security",
+                  source: {source: "local", path: $plugin_path},
+                  policy: {
+                    installation: "AVAILABLE",
+                    authentication: "ON_USE",
+                    products: ["CODEX"]
+                  },
+                  category: "Security"
+                }
+              ]
+            }' > "$marketplace_dir/marketplace.json"
+
+          mkdir -p "$codex_home"
+          printf '[plugins."codex-security@ci-local"]\nenabled = true\n' > "$codex_home/config.toml"
+
+          test -f "$plugin_install_dir/skills/security-diff-scan/SKILL.md"
+          echo "codex-home=$codex_home" >> "$GITHUB_OUTPUT"
+          echo "plugin-version=$plugin_version" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Run Codex Security diff scan
+        id: run-codex-security
+        uses: openai/codex-action@v1
         with:
           openai-api-key: ${{ secrets.TAC3KEY }}
           model: ${{ vars.CYBER54 }}
+          effort: high
+          codex-home: ${{ steps.install-codex-security.outputs.codex-home }}
           working-directory: ${{ github.workspace }}
-          output-file: test-outputs/codex-sast-summary.md
+          output-file: test-outputs/codex-security-summary.md
           sandbox: workspace-write
           prompt: |
-            ${{ vars.SASTPROMPT }}
+            Use $codex-security:security-diff-scan to review the changes from
+            ${{ github.event.pull_request.base.sha }} to
+            ${{ github.event.pull_request.head.sha }} for security regressions.
 
-            Follow the requested output directory exactly: test-outputs/SAST-FINDINGS.
-            Save all SAST scan outputs, notes, summaries, source files, sink files, PoCs, diagrams, and machine-readable findings under test-outputs/SAST-FINDINGS. Do not modify application source files.
-            Save SARIF v2.1.0 findings at exactly test-outputs/SAST-FINDINGS/vulns.json.
-            Any SARIF output must set runs[].tool.driver.name to OpenAI Cyber.
-          codex-args: '["--full-auto"]'
+            This is a non-interactive CI run. Complete the terminal/chat workflow
+            without waiting for Codex app setup. Do not modify application source
+            files. OWASP Juice Shop intentionally contains documented training
+            vulnerabilities, so report only regressions introduced by this pull
+            request.
 
-      - name: Validate SAST SARIF output
+            Focus on authentication, authorization, input handling, filesystem
+            access, network requests, secrets, and changes to shared security
+            controls.
+          codex-args: '["--ephemeral"]'
+
+      - name: Collect Codex Security scan bundle
         if: always()
         run: |
           set -euo pipefail
 
-          if [ ! -f test-outputs/SAST-FINDINGS/vulns.json ]; then
-            echo "Expected SARIF file was not created: test-outputs/SAST-FINDINGS/vulns.json" | tee test-outputs/codex-sast-sarif-error.txt
+          scan_root="$RUNNER_TEMP/codex-security-scans/${{ github.event.repository.name }}"
+          if [ ! -d "$scan_root" ]; then
+            echo "Codex Security did not create its scan directory: $scan_root" | tee test-outputs/codex-security-artifact-error.txt
             exit 1
           fi
 
-          jq -e '.version == "2.1.0" and (.runs | type == "array")' test-outputs/SAST-FINDINGS/vulns.json >/dev/null
-        shell: bash
+          reports="$(find "$scan_root" -mindepth 2 -maxdepth 2 -type f -name report.md)"
+          report_count="$(printf '%s\n' "$reports" | awk 'NF { count++ } END { print count + 0 }')"
+          if [ "$report_count" -ne 1 ]; then
+            echo "Expected exactly one Codex Security report, found $report_count." | tee test-outputs/codex-security-artifact-error.txt
+            exit 1
+          fi
 
-      - name: Normalize SAST SARIF metadata
-        if: always() && hashFiles('test-outputs/SAST-FINDINGS/vulns.json') != ''
-        run: |
-          set -euo pipefail
+          scan_dir="$(dirname "$reports")"
+          cp -a "$scan_dir" test-outputs/codex-security-scan
 
-          sarif="test-outputs/SAST-FINDINGS/vulns.json"
-          automation_id="openai-cyber-sast"
-          tmp="${sarif}.tmp"
-          jq --arg automation_id "$automation_id" '
-            .runs |= map(
-              .tool.driver.name = "OpenAI Cyber" |
-              .tool.driver.fullName = "OpenAI Cyber SAST" |
-              .tool.driver.informationUri = "https://openai.com" |
-              .automationDetails.id = $automation_id
-            )
-          ' "$sarif" > "$tmp"
-          mv "$tmp" "$sarif"
-        shell: bash
+          sarif="$scan_dir/exports/results.sarif"
+          if [ ! -f "$sarif" ]; then
+            echo "Expected Codex Security SARIF export was not created: $sarif" | tee test-outputs/codex-security-sarif-error.txt
+            exit 1
+          fi
 
-      - name: Prepare SAST SARIF for code scanning
-        if: always() && hashFiles('test-outputs/SAST-FINDINGS/vulns.json') != ''
-        run: |
-          set -euo pipefail
-
-          cp test-outputs/SAST-FINDINGS/vulns.json vulns.sarif
-          cp vulns.sarif test-outputs/SAST-FINDINGS/vulns.sarif
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' "$sarif" >/dev/null
+          cp "$sarif" test-outputs/codex-security-results.sarif
         shell: bash
 
       - name: Upload result to GitHub Code Scanning
-        if: always() && hashFiles('vulns.sarif') != ''
+        if: always() && hashFiles('test-outputs/codex-security-results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: vulns.sarif
+          sarif_file: test-outputs/codex-security-results.sarif
 
-      - name: Upload SAST outputs
-        id: upload-sast-outputs
+      - name: Upload Codex Security outputs
+        id: upload-codex-security-outputs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: codex-sast-test-outputs
+          name: codex-security-test-outputs
           path: test-outputs/
           if-no-files-found: error
           retention-days: 14
           compression-level: 6
 
-      - name: Summarize SAST artifact
-        if: always() && steps.upload-sast-outputs.outcome == 'success'
+      - name: Summarize Codex Security artifact
+        if: always() && steps.upload-codex-security-outputs.outcome == 'success'
         run: |
           {
-            echo "## SAST artifact"
+            echo "## Codex Security artifact"
             echo
-            echo "- Name: codex-sast-test-outputs"
-            echo "- URL: ${{ steps.upload-sast-outputs.outputs.artifact-url }}"
-            echo "- ID: ${{ steps.upload-sast-outputs.outputs.artifact-id }}"
-            echo "- SHA-256: ${{ steps.upload-sast-outputs.outputs.artifact-digest }}"
+            echo "- Plugin version: ${{ steps.install-codex-security.outputs.plugin-version }}"
+            echo "- Name: codex-security-test-outputs"
+            echo "- URL: ${{ steps.upload-codex-security-outputs.outputs.artifact-url }}"
+            echo "- ID: ${{ steps.upload-codex-security-outputs.outputs.artifact-id }}"
+            echo "- SHA-256: ${{ steps.upload-codex-security-outputs.outputs.artifact-digest }}"
           } >> "$GITHUB_STEP_SUMMARY"
         shell: bash

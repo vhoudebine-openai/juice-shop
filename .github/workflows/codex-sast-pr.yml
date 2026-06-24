@@ -1,4 +1,4 @@
-name: Codex SAST PR
+name: Codex Security PR
 
 on:
   pull_request:
@@ -9,12 +9,12 @@ permissions:
   security-events: write
 
 concurrency:
-  group: codex-sast-pr-${{ github.event.pull_request.number || github.ref }}
+  group: codex-security-pr-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  codex-sast:
-    name: Codex SAST
+  codex-security:
+    name: Codex Security
     permissions:
       actions: read
       contents: read
