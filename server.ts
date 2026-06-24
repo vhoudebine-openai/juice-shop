@@ -89,6 +89,7 @@ import { performRedirect } from './routes/redirect'
 import { serveEasterEgg } from './routes/easterEgg'
 import { getLanguageList } from './routes/languages'
 import { getUserProfile } from './routes/userProfile'
+import { lookupUserByEmail } from './routes/userLookup'
 import { serveAngularClient } from './routes/angular'
 import { resetPassword } from './routes/resetPassword'
 import { serveLogFiles } from './routes/logfileServer'
@@ -598,6 +599,9 @@ function configureApp (app: ReturnType<typeof express>, seq: typeof sequelize) {
   app.get('/rest/user/security-question', utils.asyncHandler(securityQuestion()))
   app.get('/rest/user/whoami', security.updateAuthenticatedUsers(), utils.asyncHandler(retrieveLoggedInUser()))
   app.get('/rest/user/authentication-details', utils.asyncHandler(authenticatedUsers()))
+  if (process.env.ENABLE_EXPERIMENTAL_USER_LOOKUP === 'true') {
+    app.get('/rest/user/lookup', utils.asyncHandler(lookupUserByEmail()))
+  }
   app.get('/rest/products/search', utils.asyncHandler(searchProducts()))
   app.get('/rest/basket/:id', utils.asyncHandler(retrieveBasket()))
   app.post('/rest/basket/:id/checkout', placeOrder())

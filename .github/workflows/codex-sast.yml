@@ -145,13 +145,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          scan_root="$RUNNER_TEMP/codex-security-scans/${{ github.event.repository.name }}"
-          if [ ! -d "$scan_root" ]; then
-            echo "Codex Security did not create its scan directory: $scan_root" | tee test-outputs/codex-security-artifact-error.txt
-            exit 1
-          fi
-
-          reports="$(find "$scan_root" -mindepth 2 -maxdepth 2 -type f -name report.md)"
+          reports="$(
+            for scan_root in \
+              "$RUNNER_TEMP/codex-security-scans/${{ github.event.repository.name }}" \
+              "/tmp/codex-security-scans/${{ github.event.repository.name }}"; do
+              if [ -d "$scan_root" ]; then
+                find "$scan_root" -mindepth 2 -maxdepth 2 -type f -name report.md
+              fi
+            done
+          )"
           report_count="$(printf '%s\n' "$reports" | awk 'NF { count++ } END { print count + 0 }')"
           if [ "$report_count" -ne 1 ]; then
             echo "Expected exactly one Codex Security report, found $report_count." | tee test-outputs/codex-security-artifact-error.txt
